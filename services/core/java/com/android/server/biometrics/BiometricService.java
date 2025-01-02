@@ -130,6 +130,8 @@ public class BiometricService extends SystemService {
 
     private final BiometricNotificationLogger mBiometricNotificationLogger;
 
+    private final BiometricRegistrationManager mBiometricRegistrationManager;
+
     /**
      * Tracks authenticatorId invalidation. For more details, see
      * {@link com.android.server.biometrics.sensors.InvalidationRequesterClient}.
@@ -506,6 +508,8 @@ public class BiometricService extends SystemService {
      * sensor arbitration, threading, etc.
      */
     private final class BiometricServiceWrapper extends IBiometricService.Stub {
+        private final BiometricRegistrationManager mBiometricRegistrationManager;
+
         @android.annotation.EnforcePermission(android.Manifest.permission.USE_BIOMETRIC_INTERNAL)
         @Override // Binder call
         public ITestSession createTestSession(int sensorId, @NonNull ITestSessionCallback callback,
@@ -750,7 +754,7 @@ public class BiometricService extends SystemService {
             mEnabledOnKeyguardCallbacks.add(new EnabledOnKeyguardCallback(callback));
             final List<UserInfo> aliveUsers = mUserManager.getAliveUsers();
             try {
-                for (UserInfo userInfo: aliveUsers) {
+                for (UserInfo userInfo : aliveUsers) {
                     final int userId = userInfo.id;
                     callback.onChanged(mSettingObserver.getEnabledOnKeyguard(userId),
                             userId);
@@ -812,7 +816,7 @@ public class BiometricService extends SystemService {
 
             if (!Utils.isAtLeastStrength(getSensorForId(fromSensorId).getCurrentStrength(),
                     Authenticators.BIOMETRIC_STRONG)) {
-                Slog.w(TAG, "Sensor: " + fromSensorId + " is does not meet the required strength to"
+                Slog.w(TAG, "Sensor: " + fromSensorId + " does not meet the required strength to"
                         + " request resetLockout");
                 return;
             }
@@ -1151,7 +1155,7 @@ public class BiometricService extends SystemService {
         mBiometricStrengthController = mInjector.getBiometricStrengthController(this);
         mBiometricStrengthController.startListening();
 
-        mHandler.post(new Runnable(){
+        mHandler.post(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -1166,15 +1170,6 @@ public class BiometricService extends SystemService {
         });
     }
 
-    @Override
-    public void onStop() {
-        super.onStop();
-        // Unregister all authenticators
-        for (BiometricSensor sensor : mSensors) {
-            mBiometricRegistrationManager.unregisterAuthenticator(sensor.id);
-        }
-        mSensors.clear();
-    }
 
     private boolean isStrongBiometric(int id) {
         for (BiometricSensor sensor : mSensors) {
@@ -1529,6 +1524,7 @@ public class BiometricService extends SystemService {
  */
 class BiometricRegistrationManager {
 
+    private static final String TAG = "BiometricRegistrationManager";
     private final Set<Integer> mRegisteredSensorIds = new HashSet<>();
 
     /**
@@ -1560,109 +1556,4 @@ class BiometricRegistrationManager {
     public synchronized void unregisterAuthenticator(int id) {
         mRegisteredSensorIds.remove(id);
     }
-}
-
-/**
- * Modify the BiometricService to use the BiometricRegistrationManager for authenticator registrations.
- */
-@android.annotation.EnforcePermission(android.Manifest.permission.USE_BIOMETRIC_INTERNAL)
-@Override // Binder call
-public synchronized void registerAuthenticator(int id, int modality,
-        @Authenticators.Types int strength,
-        @NonNull IBiometricAuthenticator authenticator) {
-
-    super.registerAuthenticator_enforcePermission();
-
-    Slog.d(TAG, "Registering ID: " + id
-            + " Modality: " + modality
-            + " Strength: " + strength);
-
-    if (authenticator == null) {
-        throw new IllegalArgumentException("Authenticator must not be null."
-                + " Did you forget to modify the core/res/res/values/xml overlay for"
-                + " config_biometric_sensors?");
-    }
-
-    // Note that we allow BIOMETRIC_CONVENIENCE to register because BiometricService
-    // also does / will do other things such as keep track of lock screen timeout, etc.
-    // Just because a biometric is registered does not mean it can participate in
-    // the android.hardware.biometrics APIs.
-    if (strength != Authenticators.BIOMETRIC_STRONG
-            && strength != Authenticators.BIOMETRIC_WEAK
-            && strength != Authenticators.BIOMETRIC_CONVENIENCE) {
-        throw new IllegalStateException("Unsupported strength");
-    }
-
-    // Use the BiometricRegistrationManager to handle the registration
-    if (!mBiometricRegistrationManager.registerAuthenticator(id, modality, strength, authenticator)) {
-        return;
-    }
-
-    mSensors.add(new BiometricSensor(getContext(), id, modality, strength, authenticator) {
-        @Override
-        boolean confirmationAlwaysRequired(int userId) {
-            return mSettingObserver.getConfirmationAlwaysRequired(modality, userId);
-        }
-
-        @Override
-        boolean confirmationSupported() {
-            return Utils.isConfirmationSupported(modality);
-        }
-    });
-
-    mBiometricStrengthController.updateStrengths();
-}
-
-/**
- * Add the BiometricRegistrationManager to the BiometricService.
- */
-@VisibleForTesting
-BiometricService(Context context, Injector injector,
-        BiometricHandlerProvider biometricHandlerProvider) {
-    super(context);
-
-    mInjector = injector;
-    mHandler = biometricHandlerProvider.getBiometricCallbackHandler();
-    mDevicePolicyManager = mInjector.getDevicePolicyManager(context);
-    mImpl = new BiometricServiceWrapper();
-    mEnabledOnKeyguardCallbacks = new ArrayList<>();
-    mSettingObserver = mInjector.getSettingObserver(context, mHandler,
-            mEnabledOnKeyguardCallbacks);
-    mRequestCounter = mInjector.getRequestGenerator();
-    mBiometricContext = injector.getBiometricContext(context);
-    mUserManager = injector.getUserManager(context);
-    mBiometricCameraManager = injector.getBiometricCameraManager(context);
-    mKeystoreAuthorization = injector.getKeystoreAuthorizationService();
-    mGateKeeper = injector.getGateKeeperService();
-    mBiometricNotificationLogger = injector.getNotificationLogger();
-
-    // Initialize the BiometricRegistrationManager
-    mBiometricRegistrationManager = new BiometricRegistrationManager();
-
-    try {
-        injector.getActivityManagerService().registerUserSwitchObserver(
-                new UserSwitchObserver() {
-                    @Override
-                    public void onUserSwitchComplete(int newUserId) {
-                        mSettingObserver.updateContentObserver();
-                        mSettingObserver.notifyEnabledOnKeyguardCallbacks(newUserId);
-                    }
-                }, BiometricService.class.getName()
-        );
-    } catch (RemoteException e) {
-        Slog.e(TAG, "Failed to register user switch observer", e);
-    }
-}
-
-/**
- * Unregister the authenticator when the service is stopped.
- */
-@Override
-public void onStop() {
-    super.onStop();
-    // Unregister all authenticators
-    for (BiometricSensor sensor : mSensors) {
-        mBiometricRegistrationManager.unregisterAuthenticator(sensor.id);
-    }
-    mSensors.clear();
 }
