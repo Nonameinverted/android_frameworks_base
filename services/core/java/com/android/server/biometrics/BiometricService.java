@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2018 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.android.server.biometrics;
 
 import static android.Manifest.permission.USE_BIOMETRIC_INTERNAL;
@@ -21,7 +5,6 @@ import static android.hardware.biometrics.BiometricAuthenticator.TYPE_FACE;
 import static android.hardware.biometrics.BiometricAuthenticator.TYPE_FINGERPRINT;
 import static android.hardware.biometrics.BiometricManager.Authenticators;
 import static android.hardware.biometrics.BiometricManager.BIOMETRIC_NO_AUTHENTICATION;
-
 import static com.android.server.biometrics.BiometricServiceStateProto.STATE_AUTH_IDLE;
 
 import android.annotation.NonNull;
@@ -94,6 +77,7 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -736,10 +720,9 @@ public class BiometricService extends SystemService {
                 throw new IllegalStateException("Unsupported strength");
             }
 
-            for (BiometricSensor sensor : mSensors) {
-                if (sensor.id == id) {
-                    throw new IllegalStateException("Cannot register duplicate authenticator");
-                }
+            // Use the BiometricRegistrationManager to handle the registration
+            if (!mBiometricRegistrationManager.registerAuthenticator(id, modality, strength, authenticator)) {
+                return;
             }
 
             mSensors.add(new BiometricSensor(getContext(), id, modality, strength, authenticator) {
@@ -894,7 +877,6 @@ public class BiometricService extends SystemService {
                 int userId,
                 int callingUserId,
                 @Authenticators.Types int authenticators) {
-
 
             super.getCurrentModality_enforcePermission();
 
@@ -1142,6 +1124,9 @@ public class BiometricService extends SystemService {
         mGateKeeper = injector.getGateKeeperService();
         mBiometricNotificationLogger = injector.getNotificationLogger();
 
+        // Initialize the BiometricRegistrationManager
+        mBiometricRegistrationManager = new BiometricRegistrationManager();
+
         try {
             injector.getActivityManagerService().registerUserSwitchObserver(
                     new UserSwitchObserver() {
@@ -1181,6 +1166,16 @@ public class BiometricService extends SystemService {
         });
     }
 
+    @Override
+    public void onStop() {
+        super.onStop();
+        // Unregister all authenticators
+        for (BiometricSensor sensor : mSensors) {
+            mBiometricRegistrationManager.unregisterAuthenticator(sensor.id);
+        }
+        mSensors.clear();
+    }
+
     private boolean isStrongBiometric(int id) {
         for (BiometricSensor sensor : mSensors) {
             if (sensor.id == id) {
@@ -1216,7 +1211,6 @@ public class BiometricService extends SystemService {
 
     private void handleAuthenticationRejected(long requestId, int sensorId) {
         Slog.v(TAG, "handleAuthenticationRejected()");
-
         // Should never happen, log this to catch bad HAL behavior (e.g. auth rejected
         // after user dismissed/canceled dialog).
         final AuthSession session = getAuthSessionIfCurrent(requestId);
@@ -1319,7 +1313,6 @@ public class BiometricService extends SystemService {
 
     private void handleOnSystemEvent(long requestId, int event) {
         Slog.d(TAG, "onSystemEvent: " + event);
-
         final AuthSession session = getAuthSessionIfCurrent(requestId);
         if (session == null) {
             Slog.w(TAG, "handleOnSystemEvent: AuthSession is not current");
@@ -1345,7 +1338,6 @@ public class BiometricService extends SystemService {
 
     private void handleOnDialogAnimatedIn(long requestId, boolean startFingerprintNow) {
         Slog.d(TAG, "handleOnDialogAnimatedIn");
-
         final AuthSession session = getAuthSessionIfCurrent(requestId);
         if (session == null) {
             Slog.w(TAG, "handleOnDialogAnimatedIn: AuthSession is not current");
@@ -1357,7 +1349,6 @@ public class BiometricService extends SystemService {
 
     private void handleOnStartFingerprintNow(long requestId) {
         Slog.d(TAG, "handleOnStartFingerprintNow");
-
         final AuthSession session = getAuthSessionIfCurrent(requestId);
         if (session == null) {
             Slog.w(TAG, "handleOnStartFingerprintNow: AuthSession is not current");
@@ -1531,4 +1522,147 @@ public class BiometricService extends SystemService {
         pw.println();
     }
 
+}
+
+/**
+ * Registration manager to handle biometric authenticator registrations and prevent duplicates.
+ */
+class BiometricRegistrationManager {
+
+    private final Set<Integer> mRegisteredSensorIds = new HashSet<>();
+
+    /**
+     * Registers a biometric authenticator if it is not already registered.
+     *
+     * @param id The ID of the biometric authenticator.
+     * @param modality The modality of the biometric authenticator.
+     * @param strength The strength of the biometric authenticator.
+     * @param authenticator The biometric authenticator implementation.
+     * @return True if the authenticator was registered, false if it was already registered.
+     */
+    public synchronized boolean registerAuthenticator(int id, int modality,
+            @Authenticators.Types int strength,
+            @NonNull IBiometricAuthenticator authenticator) {
+        if (mRegisteredSensorIds.contains(id)) {
+            Slog.w(TAG, "Duplicate authenticator registration attempt for ID: " + id);
+            return false;
+        }
+
+        mRegisteredSensorIds.add(id);
+        return true;
+    }
+
+    /**
+     * Unregisters a biometric authenticator.
+     *
+     * @param id The ID of the biometric authenticator.
+     */
+    public synchronized void unregisterAuthenticator(int id) {
+        mRegisteredSensorIds.remove(id);
+    }
+}
+
+/**
+ * Modify the BiometricService to use the BiometricRegistrationManager for authenticator registrations.
+ */
+@android.annotation.EnforcePermission(android.Manifest.permission.USE_BIOMETRIC_INTERNAL)
+@Override // Binder call
+public synchronized void registerAuthenticator(int id, int modality,
+        @Authenticators.Types int strength,
+        @NonNull IBiometricAuthenticator authenticator) {
+
+    super.registerAuthenticator_enforcePermission();
+
+    Slog.d(TAG, "Registering ID: " + id
+            + " Modality: " + modality
+            + " Strength: " + strength);
+
+    if (authenticator == null) {
+        throw new IllegalArgumentException("Authenticator must not be null."
+                + " Did you forget to modify the core/res/res/values/xml overlay for"
+                + " config_biometric_sensors?");
+    }
+
+    // Note that we allow BIOMETRIC_CONVENIENCE to register because BiometricService
+    // also does / will do other things such as keep track of lock screen timeout, etc.
+    // Just because a biometric is registered does not mean it can participate in
+    // the android.hardware.biometrics APIs.
+    if (strength != Authenticators.BIOMETRIC_STRONG
+            && strength != Authenticators.BIOMETRIC_WEAK
+            && strength != Authenticators.BIOMETRIC_CONVENIENCE) {
+        throw new IllegalStateException("Unsupported strength");
+    }
+
+    // Use the BiometricRegistrationManager to handle the registration
+    if (!mBiometricRegistrationManager.registerAuthenticator(id, modality, strength, authenticator)) {
+        return;
+    }
+
+    mSensors.add(new BiometricSensor(getContext(), id, modality, strength, authenticator) {
+        @Override
+        boolean confirmationAlwaysRequired(int userId) {
+            return mSettingObserver.getConfirmationAlwaysRequired(modality, userId);
+        }
+
+        @Override
+        boolean confirmationSupported() {
+            return Utils.isConfirmationSupported(modality);
+        }
+    });
+
+    mBiometricStrengthController.updateStrengths();
+}
+
+/**
+ * Add the BiometricRegistrationManager to the BiometricService.
+ */
+@VisibleForTesting
+BiometricService(Context context, Injector injector,
+        BiometricHandlerProvider biometricHandlerProvider) {
+    super(context);
+
+    mInjector = injector;
+    mHandler = biometricHandlerProvider.getBiometricCallbackHandler();
+    mDevicePolicyManager = mInjector.getDevicePolicyManager(context);
+    mImpl = new BiometricServiceWrapper();
+    mEnabledOnKeyguardCallbacks = new ArrayList<>();
+    mSettingObserver = mInjector.getSettingObserver(context, mHandler,
+            mEnabledOnKeyguardCallbacks);
+    mRequestCounter = mInjector.getRequestGenerator();
+    mBiometricContext = injector.getBiometricContext(context);
+    mUserManager = injector.getUserManager(context);
+    mBiometricCameraManager = injector.getBiometricCameraManager(context);
+    mKeystoreAuthorization = injector.getKeystoreAuthorizationService();
+    mGateKeeper = injector.getGateKeeperService();
+    mBiometricNotificationLogger = injector.getNotificationLogger();
+
+    // Initialize the BiometricRegistrationManager
+    mBiometricRegistrationManager = new BiometricRegistrationManager();
+
+    try {
+        injector.getActivityManagerService().registerUserSwitchObserver(
+                new UserSwitchObserver() {
+                    @Override
+                    public void onUserSwitchComplete(int newUserId) {
+                        mSettingObserver.updateContentObserver();
+                        mSettingObserver.notifyEnabledOnKeyguardCallbacks(newUserId);
+                    }
+                }, BiometricService.class.getName()
+        );
+    } catch (RemoteException e) {
+        Slog.e(TAG, "Failed to register user switch observer", e);
+    }
+}
+
+/**
+ * Unregister the authenticator when the service is stopped.
+ */
+@Override
+public void onStop() {
+    super.onStop();
+    // Unregister all authenticators
+    for (BiometricSensor sensor : mSensors) {
+        mBiometricRegistrationManager.unregisterAuthenticator(sensor.id);
+    }
+    mSensors.clear();
 }
