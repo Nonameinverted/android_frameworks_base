@@ -709,7 +709,7 @@ public class BiometricService extends SystemService {
         }
 
         @android.annotation.EnforcePermission(android.Manifest.permission.USE_BIOMETRIC_INTERNAL)
-        @Override
+        @Override // Binder call
         public synchronized void registerAuthenticator(int id, int modality,
                 @Authenticators.Types int strength,
                 @NonNull IBiometricAuthenticator authenticator) {
@@ -736,12 +736,22 @@ public class BiometricService extends SystemService {
                 throw new IllegalStateException("Unsupported strength");
             }
 
+            // Check for existing sensor with the same ID
+            BiometricSensor existingSensor = null;
             for (BiometricSensor sensor : mSensors) {
                 if (sensor.id == id) {
-                    throw new IllegalStateException("Cannot register duplicate authenticator");
+                    existingSensor = sensor;
+                    break;
                 }
             }
 
+            // If the sensor already exists, log and replace it
+            if (existingSensor != null) {
+                Slog.w(TAG, "Replacing existing authenticator with ID: " + id);
+                mSensors.remove(existingSensor);
+            }
+
+            // Add the new biometric sensor
             mSensors.add(new BiometricSensor(getContext(), id, modality, strength, authenticator) {
                 @Override
                 boolean confirmationAlwaysRequired(int userId) {
@@ -754,6 +764,7 @@ public class BiometricService extends SystemService {
                 }
             });
 
+            // Update biometric strengths
             mBiometricStrengthController.updateStrengths();
         }
 
